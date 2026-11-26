@@ -769,6 +769,76 @@ check_venv_matches_lock() {
     return "$status"
 }
 
+# Checks one sdist in the directory $1 for rust-toolchain.toml at its root,
+# with the same bytes as the file in the current directory. Exits 0 when it
+# is there once and identical, 1 when it is missing, differs, is not a
+# regular file or is there more than once, 2 when the sdist cannot be read.
+SDIST_TOOLCHAIN_PY='
+import pathlib
+import sys
+import tarfile
+
+out = pathlib.Path(sys.argv[1])
+name = "rust-toolchain.toml"
+archives = sorted(out.glob("*.tar.gz"))
+if len(archives) != 1:
+    print(f"maturin sdist wrote {len(archives)} .tar.gz files to {out}, expected one (D66).")
+    sys.exit(2)
+try:
+    want = pathlib.Path(name).read_bytes()
+    with tarfile.open(archives[0]) as sdist:
+        members = sdist.getmembers()
+        tops = {member.name.split("/", 1)[0] for member in members}
+        if len(tops) != 1:
+            print(f"The sdist {archives[0].name} has {len(tops)} top directories, expected one (D66).")
+            sys.exit(2)
+        path = tops.pop() + "/" + name
+        found = [member for member in members if member.name == path]
+        if not found:
+            print(f"The sdist {archives[0].name} has no {path}, so a wheel built from it compiles with the builder default toolchain, not the pin. Add {name} to include in [tool.maturin] in pyproject.toml (D66).")
+            sys.exit(1)
+        if len(found) > 1:
+            print(f"The sdist {archives[0].name} holds {path} {len(found)} times, expected once (D66).")
+            sys.exit(1)
+        member = found[0]
+        if not member.isfile():
+            print(f"{path} in the sdist {archives[0].name} is not a regular file (D66).")
+            sys.exit(1)
+        extracted = sdist.extractfile(member)
+        got = extracted.read() if extracted else b""
+except (OSError, tarfile.TarError) as error:
+    print("Reading the sdist failed:", error)
+    sys.exit(2)
+if got != want:
+    print(f"{path} in the sdist {archives[0].name} differs from {name} in the repository, so a wheel built from it does not use the pinned toolchain (D66).")
+    sys.exit(1)
+'
+
+# Builds the sdist with the venv's locked maturin into a fresh directory under
+# $1, the gate's temporary directory, never into the tree, and checks that it
+# carries rust-toolchain.toml unchanged, so a wheel built from it compiles with
+# the pinned toolchain (D66). cargo runs offline on the crates the earlier
+# steps fetched into the gate's cargo home.
+check_sdist_toolchain() {
+    local out output status
+    if ! out=$(mktemp -d "$1/sdist.XXXXXX"); then
+        echo "mktemp -d under $1 failed, so the sdist has nowhere to go (D66)."
+        return 2
+    fi
+    output=$(CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=never venv_tool maturin sdist --out "$out" 2>&1)
+    status=$?
+    if ((status != 0)); then
+        echo "$output"
+        echo "maturin sdist failed (exit $status), so the sdist cannot be checked for rust-toolchain.toml (D66). Its output is above."
+        rm -rf -- "$out"
+        return 2
+    fi
+    python3 -I -c "$SDIST_TOOLCHAIN_PY" "$out"
+    status=$?
+    rm -rf -- "$out"
+    return "$status"
+}
+
 # The dataset manifest does not exist yet, so neither does its hash check. A
 # manifest that appears before the check is written fails the gate.
 check_manifest() {

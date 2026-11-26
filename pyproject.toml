@@ -26,6 +26,9 @@ manifest-path = "crates/nasion-py/Cargo.toml"
 python-source = "python"
 python-packages = ["nasion"]
 module-name = "nasion._nasion"
+# The toolchain pin travels in the sdist, so a wheel built from it compiles
+# with the pinned toolchain, not the builder's default (D66).
+include = [{ path = "rust-toolchain.toml", format = "sdist" }]
 
 [tool.ruff]
 target-version = "py311"

@@ -175,6 +175,7 @@ step "dash sweep" check_dashes
 step "instruction files" check_instruction_paths git ls-files -z
 step "banned names" banned_names
 step "manifest hash" check_manifest
+step "sdist toolchain" check_sdist_toolchain "$GATE_TMP"
 step "tree unchanged" check_tree_unchanged "$tree_before"
 
 exit "$failed"
