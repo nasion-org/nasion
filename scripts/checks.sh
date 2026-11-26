@@ -814,23 +814,39 @@ if got != want:
     sys.exit(1)
 '
 
+# Builds the sdist into $1. A failed maturin prints the D66 line and returns 3,
+# so that through fail_on_warnings 1 still means a warning and 2 a failed
+# warning search.
+maturin_sdist() {
+    local status
+    CARGO_NET_OFFLINE=true venv_tool maturin sdist --out "$1"
+    status=$?
+    ((status == 0)) && return 0
+    echo "maturin sdist failed (exit $status), so the sdist cannot be checked for rust-toolchain.toml (D66). Its output is above."
+    return 3
+}
+
 # Builds the sdist with the venv's locked maturin into a fresh directory under
 # $1, the gate's temporary directory, never into the tree, and checks that it
 # carries rust-toolchain.toml unchanged, so a wheel built from it compiles with
 # the pinned toolchain (D66). cargo runs offline on the crates the earlier
-# steps fetched into the gate's cargo home.
+# steps fetched into the gate's cargo home. A warning from maturin or cargo
+# fails the step (D67).
 check_sdist_toolchain() {
     local out output status
     if ! out=$(mktemp -d "$1/sdist.XXXXXX"); then
         echo "mktemp -d under $1 failed, so the sdist has nowhere to go (D66)."
         return 2
     fi
-    output=$(CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=never venv_tool maturin sdist --out "$out" 2>&1)
+    output=$(fail_on_warnings maturin_sdist "$out")
     status=$?
     if ((status != 0)); then
         echo "$output"
-        echo "maturin sdist failed (exit $status), so the sdist cannot be checked for rust-toolchain.toml (D66). Its output is above."
         rm -rf -- "$out"
+        if ((status == 1)); then
+            echo "maturin sdist printed a warning, so the sdist step fails. Fix the warning at its source (D67)."
+            return 1
+        fi
         return 2
     fi
     python3 -I -c "$SDIST_TOOLCHAIN_PY" "$out"

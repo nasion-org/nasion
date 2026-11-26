@@ -1,5 +1,6 @@
 [package]
 name = "nasion-py"
+description = "Python binding for Nasion, a reference bench for brain signal software."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
