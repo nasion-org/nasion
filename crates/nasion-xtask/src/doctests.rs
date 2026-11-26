@@ -1204,6 +1204,22 @@ mod tests {
         ] {
             assert!(!ignored(info), "{info:?}");
         }
+        for form in [
+            "ignore-windows",
+            "ignore-linux",
+            "ignore-",
+            "ignore-x86_64",
+            "\"ignore-windows\"",
+        ] {
+            for (info, without) in [
+                (format!("ignore,{form}"), "ignore,"),
+                (format!("{form},ignore"), ",ignore"),
+                (format!("rust\tignore\t{form}"), "rust\tignore\t"),
+            ] {
+                assert!(ignored(without), "{without:?}");
+                assert!(!ignored(&info), "{info:?}");
+            }
+        }
     }
 
     #[test]
