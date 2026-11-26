@@ -81,11 +81,22 @@ struct CodeBlock {
 }
 
 impl CodeBlock {
-    /// rustdoc lists `ignore` blocks but never compiles them.
+    /// True only for a block rustdoc never compiles on any target: its info
+    /// string holds the word `ignore` and no word starting with `ignore-`.
+    /// `LangString::parse` sets `Ignore::All` for `ignore`, collects each
+    /// `ignore-<x>` word, and lets those override `ignore` with `Ignore::Some`
+    /// (src/librustdoc/html/markdown.rs lines 1263 to 1271 and 1389 to 1392).
+    /// An `Ignore::Some` block is skipped only on a target whose name contains
+    /// one of the `<x>` (src/librustdoc/doctest.rs line 1162), both at commit
+    /// 0ef1bc386059596dada8fb65b50425aab2ea637a. So a block with an
+    /// `ignore-<x>` word, a bare `ignore-` included, is always scanned and the
+    /// scan does not depend on the host that runs the gate. An info string
+    /// rustdoc rejects gives false, as in `compile_fail`, and the block is
+    /// scanned (D64).
     fn ignored(&self) -> bool {
-        self.info
-            .split([',', ' ', '\t'])
-            .any(|word| word == "ignore" || word.starts_with("ignore-"))
+        lang_words(&self.info).is_some_and(|words| {
+            words.contains(&"ignore") && !words.iter().any(|word| word.starts_with("ignore-"))
+        })
     }
 
     /// rustdoc fails a `compile_fail` test whose code compiles (D63). An info
@@ -1146,6 +1157,88 @@ mod tests {
     #[test]
     fn code_that_does_not_tokenize_is_an_error() {
         assert!(scan("let s = \"open;").is_err());
+    }
+
+    fn ignored(info: &str) -> bool {
+        CodeBlock {
+            line: 1,
+            info: info.to_owned(),
+            code: String::new(),
+        }
+        .ignored()
+    }
+
+    /// rustdoc 1.100.0 skipped each of these on every target (D64).
+    #[test]
+    fn plain_ignore_is_skipped() {
+        for info in [
+            "ignore",
+            " ignore ",
+            "rust,ignore",
+            "ignore,rust",
+            "rust ignore",
+            "rust\tignore",
+            "rust, ,ignore",
+            "\"ignore\"",
+            "ignore(a comment)",
+            "{.c} ignore",
+        ] {
+            assert!(ignored(info), "{info:?}");
+        }
+    }
+
+    /// rustdoc 1.100.0 ran the first two on this Linux host and would run
+    /// `ignore-linux` on Windows. The scan covers all of them on every host
+    /// (D64).
+    #[test]
+    fn an_ignore_target_word_is_always_scanned() {
+        for info in [
+            "ignore-windows",
+            "ignore-linux",
+            "ignore-",
+            "ignore,ignore-windows",
+            "ignore-windows,ignore",
+            "rust\tignore-windows",
+            "rust,ignore,ignore-x86_64",
+            "\"ignore-windows\"",
+        ] {
+            assert!(!ignored(info), "{info:?}");
+        }
+    }
+
+    #[test]
+    fn words_other_than_ignore_are_scanned() {
+        for info in [
+            "",
+            "rust",
+            "ignorex",
+            "xignore",
+            "Ignore",
+            "no_ignore",
+            "rust(c, ignore, d)",
+            "rust (ignore)",
+            "rust{.ignore}",
+            "{class=ignore}",
+        ] {
+            assert!(!ignored(info), "{info:?}");
+        }
+    }
+
+    /// rustdoc reports these as invalid, so the block is no Rust doctest. The
+    /// answer is false, so if one were listed it would be scanned (D64).
+    #[test]
+    fn info_strings_rustdoc_rejects_are_scanned_even_with_ignore() {
+        for info in [
+            "ignore,=",
+            "ignore\"x\"",
+            "{ignore}",
+            "ignore,(open",
+            "ignore \"open",
+            "ignore {.c",
+        ] {
+            assert!(lang_words(info).is_none(), "{info:?}");
+            assert!(!ignored(info), "{info:?}");
+        }
     }
 
     fn compile_fail(info: &str) -> bool {
