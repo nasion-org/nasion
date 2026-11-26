@@ -11,14 +11,22 @@
 //! rustdoc reports each one at the line of the item's first doc fragment plus
 //! the offset of the opening fence in the joined doc text, so the code blocks
 //! are rebuilt the same way from each item's literal doc attributes.
+//!
+//! Doctests are written only as fenced blocks. rustdoc also compiles an
+//! indented code block as a Rust doctest, and such a doctest fails with its own
+//! message (D63). A `compile_fail` block is not scanned, because rustdoc fails
+//! that test when its code compiles, so a lint attribute in it cannot hide a
+//! warning in a passing test (D63).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
 use std::fs;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::CharIndices;
 
 use proc_macro2::{Delimiter, Ident, LexError, TokenStream, TokenTree};
 use syn::ext::IdentExt;
@@ -79,6 +87,195 @@ impl CodeBlock {
             .split([',', ' ', '\t'])
             .any(|word| word == "ignore" || word.starts_with("ignore-"))
     }
+
+    /// rustdoc fails a `compile_fail` test whose code compiles (D63). An info
+    /// string rustdoc rejects makes the block no Rust doctest, so it gives
+    /// false here and the block is scanned.
+    fn compile_fail(&self) -> bool {
+        lang_words(&self.info).is_some_and(|words| words.contains(&"compile_fail"))
+    }
+}
+
+/// The language words rustdoc reads from a fenced block's info string, or
+/// None when rustdoc rejects the string. A port of `TagIterator` and of the
+/// word match in `LangString::parse`, in src/librustdoc/html/markdown.rs of
+/// rust-lang/rust at tag 1.100.0 (commit
+/// 0ef1bc386059596dada8fb65b50425aab2ea637a). Words are separated by spaces,
+/// commas and tabs, a word may be quoted, a `( ... )` comment is skipped, and
+/// a `{ ... }` block holds only `.class` and `key=value` attributes, never a
+/// language word. rustdoc compares each word whole, so `compile_fail,E0123`
+/// holds `compile_fail` and `compile_failx` does not.
+fn lang_words(info: &str) -> Option<Vec<&str>> {
+    let mut tags = Tags {
+        chars: info.char_indices().peekable(),
+        data: info,
+        in_block: false,
+    };
+    let mut words = Vec::new();
+    while let Some(tag) = tags.next_tag().ok()? {
+        if let Tag::Word(word) = tag {
+            words.push(word);
+        }
+    }
+    Some(words)
+}
+
+enum Tag<'a> {
+    Word(&'a str),
+    Attribute,
+}
+
+/// rustdoc reports the info string as invalid.
+struct Invalid;
+
+type Step<'a> = Result<Option<Tag<'a>>, Invalid>;
+
+struct Tags<'a> {
+    chars: Peekable<CharIndices<'a>>,
+    data: &'a str,
+    in_block: bool,
+}
+
+fn is_leading_char(c: char) -> bool {
+    c == '_' || c == '-' || c == ':' || c.is_ascii_alphanumeric()
+}
+
+fn is_bareword_char(c: char) -> bool {
+    is_leading_char(c) || ".!#$%&*+/;<>?@^|~".contains(c)
+}
+
+fn is_separator(c: char) -> bool {
+    matches!(c, ' ' | ',' | '\t')
+}
+
+impl<'a> Tags<'a> {
+    fn next_tag(&mut self) -> Step<'a> {
+        while self.chars.next_if(|(_, c)| is_separator(*c)).is_some() {}
+        let Some(&(start, _)) = self.chars.peek() else {
+            return if self.in_block {
+                Err(Invalid)
+            } else {
+                Ok(None)
+            };
+        };
+        if self.in_block {
+            self.attribute()
+        } else {
+            self.word(start)
+        }
+    }
+
+    /// `parse_in_attribute_block`.
+    fn attribute(&mut self) -> Step<'a> {
+        match self.chars.next() {
+            Some((_, '}')) => {
+                self.in_block = false;
+                self.next_tag()
+            }
+            Some((pos, '.')) => self.class(pos),
+            Some((pos, c)) if c == '"' || is_leading_char(c) => self.key_value(c, pos),
+            _ => Err(Invalid),
+        }
+    }
+
+    /// `parse_outside_attribute_block`.
+    fn word(&mut self, start: usize) -> Step<'a> {
+        while let Some((pos, c)) = self.chars.next() {
+            if c == '"' {
+                if pos != start {
+                    return Err(Invalid);
+                }
+                let (from, to) = self.string(pos)?;
+                if self
+                    .chars
+                    .peek()
+                    .is_some_and(|(_, c)| *c != '{' && *c != '(' && !is_separator(*c))
+                {
+                    return Err(Invalid);
+                }
+                return Ok(Some(Tag::Word(&self.data[from..to])));
+            }
+            if c == '{' {
+                self.in_block = true;
+                return self.next_tag();
+            }
+            if is_separator(c) || c == '(' {
+                if c == '(' {
+                    self.chars.find(|(_, c)| *c == ')').ok_or(Invalid)?;
+                }
+                if pos == start {
+                    return self.next_tag();
+                }
+                return Ok(Some(Tag::Word(&self.data[start..pos])));
+            }
+            if !(is_bareword_char(c) && (pos != start || is_leading_char(c))) {
+                return Err(Invalid);
+            }
+        }
+        Ok(Some(Tag::Word(&self.data[start..])))
+    }
+
+    /// `parse_class`, after the `.` at `start`.
+    fn class(&mut self, start: usize) -> Step<'a> {
+        if self.bareword_end() == start + 1 {
+            return Err(Invalid);
+        }
+        self.after_token()?;
+        Ok(Some(Tag::Attribute))
+    }
+
+    /// `parse_key_value`, after its first character `first` at `start`.
+    fn key_value(&mut self, first: char, start: usize) -> Step<'a> {
+        let key = if first == '"' {
+            self.string(start)?
+        } else {
+            self.token(start)?
+        };
+        if key.0 == key.1 || !matches!(self.chars.next(), Some((_, '='))) {
+            return Err(Invalid);
+        }
+        let value = match self.chars.next() {
+            Some((pos, '"')) => self.string(pos)?,
+            Some((pos, c)) if is_bareword_char(c) => self.token(pos)?,
+            _ => return Err(Invalid),
+        };
+        if value.0 == value.1 {
+            return Err(Invalid);
+        }
+        self.after_token()?;
+        Ok(Some(Tag::Attribute))
+    }
+
+    /// The position after the bareword characters that follow.
+    fn bareword_end(&mut self) -> usize {
+        while self.chars.next_if(|(_, c)| is_bareword_char(*c)).is_some() {}
+        self.chars.peek().map_or(self.data.len(), |(pos, _)| *pos)
+    }
+
+    /// `parse_token`: a bareword starting at `start`, which another character
+    /// must follow.
+    fn token(&mut self, start: usize) -> Result<(usize, usize), Invalid> {
+        let end = self.bareword_end();
+        if self.chars.peek().is_none() {
+            return Err(Invalid);
+        }
+        Ok((start, end))
+    }
+
+    /// `parse_string`: the text after the quote at `start`, up to the closing
+    /// quote.
+    fn string(&mut self, start: usize) -> Result<(usize, usize), Invalid> {
+        let (end, _) = self.chars.find(|(_, c)| *c == '"').ok_or(Invalid)?;
+        Ok((start + 1, end))
+    }
+
+    /// `check_after_token`.
+    fn after_token(&mut self) -> Result<(), Invalid> {
+        match self.chars.peek() {
+            Some((_, c)) if *c != '}' && *c != '(' && !is_separator(*c) => Err(Invalid),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Returns the number of doctests rustdoc lists and one line per problem.
@@ -89,48 +286,61 @@ pub fn check(
     log: &mut dyn std::io::Write,
 ) -> Result<(usize, Vec<String>), String> {
     let listed = list(cargo, root, packages, log)?;
-    let mut parsed: HashMap<PathBuf, Vec<CodeBlock>> = HashMap::new();
+    let mut parsed: HashMap<PathBuf, DocCode> = HashMap::new();
     let mut problems = Vec::new();
     for doctest in &listed {
-        let path = root.join(&doctest.file);
-        let at = format!(
-            "{}:{} (doctest \"{}\")",
-            doctest.file, doctest.line, doctest.item
-        );
-        let blocks = match parsed.entry(path) {
+        let code = match parsed.entry(root.join(&doctest.file)) {
             Entry::Occupied(known) => known.into_mut(),
             Entry::Vacant(new) => {
-                let blocks = blocks_in_file(new.key())?;
-                new.insert(blocks)
+                let code = code_in_file(new.key())?;
+                new.insert(code)
             }
         };
-        let found: Vec<&CodeBlock> = blocks.iter().filter(|b| b.line == doctest.line).collect();
-        let block = match found.as_slice() {
-            [] => {
-                problems.push(format!(
-                    "{at} is not in a literal doc comment or #[doc = \"...\"] attribute, so its code cannot be read. It may come from include_str!, concat! or a macro. Write it as a literal doc comment (D44)."
-                ));
-                continue;
-            }
-            [block] => block,
-            _ => {
-                return Err(format!(
-                    "{at}: more than one doc code block maps to this line. Check the doc comments in {}.",
-                    doctest.file
-                ));
-            }
-        };
-        if block.ignored() {
-            continue;
-        }
-        match scan(&block.code) {
-            Ok(found) => {
-                problems.extend(found.into_iter().map(|problem| format!("{at} {problem}")))
-            }
-            Err(e) => problems.push(format!("{at} does not tokenize: {e}")),
-        }
+        problems.extend(doctest_problems(doctest, code)?);
     }
     Ok((listed.len(), problems))
+}
+
+/// The problems of one listed doctest, read from the doc code of its file.
+fn doctest_problems(doctest: &Listed, code: &DocCode) -> Result<Vec<String>, String> {
+    let at = format!(
+        "{}:{} (doctest \"{}\")",
+        doctest.file, doctest.line, doctest.item
+    );
+    let found: Vec<&CodeBlock> = code
+        .blocks
+        .iter()
+        .filter(|b| b.line == doctest.line)
+        .collect();
+    let block = match found.as_slice() {
+        [] if code.indented.contains(&doctest.line) => {
+            return Ok(vec![format!(
+                "{at} is an indented code block, which rustdoc compiles as a doctest. Doctests are written only as fenced blocks, so rewrite it between ``` fences (D63)."
+            )]);
+        }
+        [] => {
+            return Ok(vec![format!(
+                "{at} is not in a literal doc comment or #[doc = \"...\"] attribute, so its code cannot be read. It may come from include_str!, concat! or a macro. Write it as a literal doc comment (D44)."
+            )]);
+        }
+        [block] => block,
+        _ => {
+            return Err(format!(
+                "{at}: more than one doc code block maps to this line. Check the doc comments in {}.",
+                doctest.file
+            ));
+        }
+    };
+    if block.ignored() || block.compile_fail() {
+        return Ok(Vec::new());
+    }
+    Ok(match scan(&block.code) {
+        Ok(found) => found
+            .into_iter()
+            .map(|problem| format!("{at} {problem}"))
+            .collect(),
+        Err(e) => vec![format!("{at} does not tokenize: {e}")],
+    })
 }
 
 /// Lists the doctests of `packages`, the packages whose library target
@@ -213,30 +423,37 @@ fn is_count(text: &str, noun: &str) -> bool {
     })
 }
 
-fn blocks_in_file(path: &Path) -> Result<Vec<CodeBlock>, String> {
+fn code_in_file(path: &Path) -> Result<DocCode, String> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("{}, listed by rustdoc, cannot be read: {e}", path.display()))?;
     if path.extension() != Some(OsStr::new("rs")) {
-        return Ok(Vec::new());
+        return Ok(DocCode::default());
     }
-    let file = syn::parse_file(&source)
-        .map_err(|e| format!("{}, listed by rustdoc, does not parse: {e}", path.display()))?;
-    let mut collector = Collector::default();
-    collector.group(&file.attrs);
-    collector.visit_file(&file);
-    Ok(collector.blocks)
+    code_in_source(&source)
+        .map_err(|e| format!("{}, listed by rustdoc, does not parse: {e}", path.display()))
 }
 
+fn code_in_source(source: &str) -> syn::Result<DocCode> {
+    let file = syn::parse_file(source)?;
+    let mut code = DocCode::default();
+    code.group(&file.attrs);
+    code.visit_file(&file);
+    Ok(code)
+}
+
+/// What the literal doc attributes of one source file hold: their fenced
+/// code blocks, and the source lines indented as an indented code block.
 #[derive(Default)]
-struct Collector {
+struct DocCode {
     blocks: Vec<CodeBlock>,
+    indented: Vec<usize>,
 }
 
-impl Collector {
+impl DocCode {
     /// Joins the literal doc attributes of one item the way rustdoc does and
-    /// records its fenced code blocks. A group with a doc attribute that is not
-    /// a string literal records nothing, because the lines rustdoc reports for
-    /// it cannot be rebuilt.
+    /// records its fenced code blocks and indented lines. A group with a doc
+    /// attribute that is not a string literal records nothing, because the
+    /// lines rustdoc reports for it cannot be rebuilt.
     fn group(&mut self, attrs: &[Attribute]) {
         let mut first_line = None;
         let mut text = String::new();
@@ -262,13 +479,14 @@ impl Collector {
         }
         if let Some(first_line) = first_line {
             self.blocks.extend(fenced_blocks(&text, first_line));
+            self.indented.extend(indented_lines(&text, first_line));
         }
     }
 }
 
 macro_rules! doc_groups {
     ($($method:ident: $node:ty),* $(,)?) => {
-        impl<'ast> Visit<'ast> for Collector {
+        impl<'ast> Visit<'ast> for DocCode {
             $(
                 fn $method(&mut self, node: &'ast $node) {
                     self.group(&node.attrs);
@@ -342,6 +560,44 @@ fn fenced_blocks(text: &str, first_line: usize) -> Vec<CodeBlock> {
     }
     blocks.extend(open.map(|(block, _)| block));
     blocks
+}
+
+/// The source lines of joined doc text that are indented four columns or
+/// more once the least leading whitespace of its non-blank lines is removed.
+/// rustdoc removes that whitespace, counting a space or a tab as one, in
+/// `unindent_doc_fragments` in compiler/rustc_resolve/src/rustdoc.rs, and
+/// `find_codes` in src/librustdoc/html/markdown.rs gives an indented code
+/// block the default `LangString`, which is Rust, so rustdoc compiles it (both
+/// at commit 0ef1bc386059596dada8fb65b50425aab2ea637a). This only picks the
+/// message for a listed doctest with no fenced block at its line, which fails
+/// either way, so a doc mixing `///` and `#[doc]` lines, which rustdoc
+/// unindents one column differently, at worst gets the D44 message.
+fn indented_lines(text: &str, first_line: usize) -> Vec<usize> {
+    let lines: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .collect();
+    let lead = |line: &str| line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let Some(least) = lines.iter().map(|(_, line)| lead(line)).min() else {
+        return Vec::new();
+    };
+    let columns = |line: &str| {
+        line.chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .fold(0, |width, c| {
+                if c == '\t' {
+                    width + 4 - width % 4
+                } else {
+                    width + 1
+                }
+            })
+    };
+    lines
+        .into_iter()
+        .filter(|(_, line)| columns(&line[least..]) >= 4)
+        .map(|(index, _)| first_line + index)
+        .collect()
 }
 
 /// The fence and info string of a line that opens a fenced code block.
@@ -629,7 +885,8 @@ mod tests {
     }
 
     use super::{
-        DERIVES, MACROS, compiled_code, compiled_line, fenced_blocks, parse_list_line, scan,
+        CodeBlock, DERIVES, Listed, MACROS, code_in_source, compiled_code, compiled_line,
+        doctest_problems, fenced_blocks, indented_lines, lang_words, parse_list_line, scan,
     };
 
     #[test]
@@ -889,5 +1146,164 @@ mod tests {
     #[test]
     fn code_that_does_not_tokenize_is_an_error() {
         assert!(scan("let s = \"open;").is_err());
+    }
+
+    fn compile_fail(info: &str) -> bool {
+        CodeBlock {
+            line: 1,
+            info: info.to_owned(),
+            code: String::new(),
+        }
+        .compile_fail()
+    }
+
+    /// Each form was run through rustdoc 1.100.0 with a block that compiles:
+    /// the first list reported "compile fail", the second compiled the block
+    /// as a plain doctest.
+    #[test]
+    fn compile_fail_is_read_as_rustdoc_reads_it() {
+        for info in [
+            "compile_fail",
+            "compile_fail,E0123",
+            "rust,compile_fail",
+            "rust compile_fail",
+            "rust\tcompile_fail",
+            "rust, ,compile_fail",
+            " compile_fail ",
+            "\"compile_fail\"",
+            "compile_fail(reason)",
+            "rust (a comment) compile_fail",
+            "{.c} compile_fail",
+            "{class=x}compile_fail",
+            "should_panic,compile_fail,no_run",
+        ] {
+            assert!(compile_fail(info), "{info:?}");
+        }
+        for info in [
+            "",
+            "rust",
+            "rust,compile_failx",
+            "rust,compile-fail",
+            "rust,Compile_Fail",
+            "rust,(compile_fail)",
+            "rust,{.compile_fail}",
+            "rust,xcompile_fail",
+        ] {
+            assert!(!compile_fail(info), "{info:?}");
+        }
+    }
+
+    /// rustdoc reports these as invalid, so the block is no Rust doctest. The
+    /// answer is false, so if one were listed it would be scanned.
+    #[test]
+    fn info_strings_rustdoc_rejects_are_not_compile_fail() {
+        for info in [
+            "compile_fail,=",
+            "compile_fail\"x\"",
+            "{compile_fail}",
+            "compile_fail,(open",
+            "compile_fail {.c",
+            "compile_fail {.c compile_fail",
+            "compile_fail \"open",
+            "compile_fail {key=}",
+        ] {
+            assert!(lang_words(info).is_none(), "{info:?}");
+            assert!(!compile_fail(info), "{info:?}");
+        }
+    }
+
+    #[test]
+    fn words_come_out_of_quotes_comments_and_attribute_blocks() {
+        assert_eq!(
+            lang_words("rust (a, b) compile_fail,E0123 {.c key=\"v w\"} \"quoted word\"(x)")
+                .unwrap(),
+            ["rust", "compile_fail", "E0123", "quoted word"]
+        );
+        assert_eq!(lang_words("").unwrap(), Vec::<&str>::new());
+        assert_eq!(lang_words(" ,\t").unwrap(), Vec::<&str>::new());
+    }
+
+    fn problems_at(source: &str, line: usize) -> Vec<String> {
+        let doctest = Listed {
+            file: "src/lib.rs".to_owned(),
+            item: "f".to_owned(),
+            line,
+        };
+        doctest_problems(&doctest, &code_in_source(source).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn compile_fail_blocks_are_not_scanned() {
+        for info in ["compile_fail", "compile_fail,E0123", "rust compile_fail"] {
+            for code in ["let s = \"open;", "#![allow(unused)]\nlet x = 1;"] {
+                let body: String = code.lines().map(|l| format!("/// {l}\n")).collect();
+                let source =
+                    format!("/// Doc.\n///\n/// ```{info}\n{body}/// ```\npub fn f() {{}}\n");
+                assert!(problems_at(&source, 3).is_empty(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_that_only_look_like_compile_fail_are_scanned() {
+        let source = "/// Doc.\n///\n/// ```rust,compile_failx\n/// #![allow(unused)]\n/// ```\npub fn f() {}\n";
+        let found = problems_at(source, 3);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("src/lib.rs:3 (doctest \"f\") sets a lint level"));
+        let source = "/// Doc.\n///\n/// ```\n/// let s = \"open;\n/// ```\npub fn f() {}\n";
+        assert!(problems_at(source, 3)[0].contains("does not tokenize"));
+    }
+
+    #[test]
+    fn an_indented_doctest_is_rejected_with_its_own_message() {
+        for source in [
+            "/// Doc.\n///\n///     let x = 1;\npub fn f() {}\n",
+            "/// Doc.\n///\n///      let x = 1;\npub fn f() {}\n",
+            "/// Doc.\n///\n/// \tlet x = 1;\npub fn f() {}\n",
+            "/// Doc.\n///\n///     # #![allow(unused)]\n///     let x = 1;\npub fn f() {}\n",
+        ] {
+            assert_eq!(
+                problems_at(source, 3),
+                [
+                    "src/lib.rs:3 (doctest \"f\") is an indented code block, which rustdoc compiles as a doctest. Doctests are written only as fenced blocks, so rewrite it between ``` fences (D63)."
+                ],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fenced_block_in_a_list_item_is_scanned_as_fenced() {
+        let clean = "/// Doc.\n///\n/// 1. Step:\n///\n///    ```\n///    let x = 1;\n///    ```\npub fn f() {}\n";
+        assert!(problems_at(clean, 5).is_empty());
+        let lowered = clean.replace("let x = 1;", "#![allow(unused)]");
+        assert!(problems_at(&lowered, 5)[0].contains("sets a lint level"));
+    }
+
+    #[test]
+    fn doctests_with_no_readable_block_keep_the_d44_message() {
+        let d44 = "is not in a literal doc comment or #[doc = \"...\"] attribute";
+        for (source, line) in [
+            ("#[doc = include_str!(\"x.md\")]\npub fn f() {}\n", 1),
+            ("/// Doc.\n///\n/// Text.\npub fn f() {}\n", 3),
+            ("/// Doc.\n///\n///    let x = 1;\npub fn f() {}\n", 3),
+            ("/// Doc.\npub fn f() {}\n", 40),
+            ("///     let x = 1;\npub fn f() {}\n", 1),
+        ] {
+            let found = problems_at(source, line);
+            assert_eq!(found.len(), 1, "{source}");
+            assert!(
+                found[0].contains(d44) && found[0].ends_with("(D44)."),
+                "{source}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indented_lines_are_measured_from_the_least_indented_line() {
+        assert_eq!(indented_lines(" a\n\n     b\n    c\n \t d", 10), [12, 14]);
+        assert_eq!(indented_lines("     only", 1), Vec::<usize>::new());
+        assert_eq!(indented_lines("", 1), Vec::<usize>::new());
+        assert_eq!(indented_lines("a\n\tb\n   c", 1), [2]);
     }
 }
