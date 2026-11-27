@@ -162,6 +162,7 @@ python_env_status=$last_status
 step "cargo fmt" fail_on_warnings cargo fmt --all --check
 step "cargo clippy" check_clippy
 step "cargo test" fail_on_warnings cargo test --locked --workspace
+step "no doctests" check_no_doctests
 step "miri" check_unsafe_allow
 step "deny unsafe" check_deny_unsafe
 step "cargo audit" check_cargo_audit

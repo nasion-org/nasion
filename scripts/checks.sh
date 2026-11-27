@@ -497,6 +497,29 @@ check_cargo_lints_warning() {
     return "$status"
 }
 
+# Fails when rustdoc lists any doctest in the workspace (D70), counted from
+# the "N tests, M benchmarks" lines of the listing, one per doctest run.
+# nasion-py is left out: it is a cdylib only, which rustdoc does not test, and
+# listing it makes cargo warn.
+check_no_doctests() {
+    local output status counts count
+    output=$(fail_on_warnings cargo test --doc --locked --workspace --exclude nasion-py -- --list)
+    status=$?
+    echo "$output"
+    ((status != 0)) && return "$status"
+    counts=$(sed -nE 's/^([0-9]+) tests?, [0-9]+ benchmarks?$/\1/p' <<<"$output")
+    if [[ -z $counts ]]; then
+        echo "The doctest listing has no \"N tests, M benchmarks\" line, so the doctests cannot be counted (D70)."
+        return 2
+    fi
+    for count in $counts; do
+        if ((count > 0)); then
+            echo "rustdoc lists the doctests above. Doctests are not allowed; examples go under tests/ (D70)."
+            return 1
+        fi
+    done
+}
+
 # Runs clippy with -D warnings once on the host and once for each cross target
 # (D38), the same split as check_unsafe_allow, each in its own target
 # directory. Each run fails on warnings and on the [lints] warning, and a
