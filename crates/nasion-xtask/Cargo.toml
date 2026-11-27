@@ -8,9 +8,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-proc-macro2 = { version = "=1.0.107", default-features = false, features = ["span-locations"] }
 serde_json = "=1.0.154"
-syn = { version = "=3.0.10", default-features = false, features = ["full", "parsing", "visit"] }
+syn = { version = "=3.0.10", default-features = false, features = ["full", "parsing"] }
 
 [lints]
 workspace = true

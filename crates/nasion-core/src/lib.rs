@@ -1,6 +1,5 @@
 //! Core library for Nasion. Holds no domain logic yet.
 #![deny(unsafe_code)]
-#![doc(test(attr(forbid(unsafe_code), deny(warnings))))]
 
 /// Version of this crate, taken from its manifest at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -307,9 +307,8 @@ sys.exit(1 if stray else 0)
 
 # Every target root of every workspace member must hold a crate-level
 # #![deny(unsafe_code)], and every member must inherit [workspace.lints].
-# Build script and proc macro roots need forbid, and library roots also need
-# #![doc(test(attr(forbid(unsafe_code), deny(warnings))))]. nasion-xtask lists
-# the exact rules.
+# Build script and proc macro roots need forbid. nasion-xtask lists the exact
+# rules.
 # The command line forbid in check_unsafe_allow lasts only until Miri is set
 # up, so this check keeps the attributes themselves in place as SPEC Section 11
 # requires. nasion-xtask checks them by parsing each

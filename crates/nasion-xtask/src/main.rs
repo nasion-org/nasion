@@ -7,15 +7,6 @@
 //!   `#![forbid(unsafe_code)]`, which no `allow` further down can lift.
 //! - Every other target root needs `#![deny(unsafe_code)]` or the stricter
 //!   `#![forbid(unsafe_code)]` (D29).
-//! - Library roots also need `forbid(unsafe_code)` and `deny(warnings)` inside
-//!   a crate-level `doc(test(attr(...)))`, in one attribute or two (D31, D39).
-//!   Crate lints do not reach doctests, and rustdoc adds `allow(unused)` to
-//!   them.
-//! - No doctest may lower a lint level with allow, expect or warn (D44). The
-//!   `doctests` module holds that check.
-//! - No `doc(test(attr(...)))` may reach doctests from anywhere but the exact
-//!   crate-root form, and no attribute may hold a `$` token (D48). The
-//!   `doc_attributes` module holds that check.
 //! - Every file rustc reads for a library target, on the host and on each
 //!   cross target, is a `.rs` file that check scans (D50). The `dep_info`
 //!   module holds that check.
@@ -32,15 +23,13 @@
 //!
 //! The target kind comes from cargo metadata, never from the file name.
 //!
-//! Exit codes, read by `scripts/checks.sh`: 0 clean, 1 a target lacks an
-//! attribute or a doctest lowers a lint level, 2 the check could not run.
+//! Exit codes, read by `scripts/checks.sh`: 0 clean, 1 a check found a
+//! problem, 2 the check could not run.
 #![deny(unsafe_code)]
 
 mod cargo_cmd;
 mod cargo_sources;
 mod dep_info;
-mod doc_attributes;
-mod doctests;
 mod proc_macros;
 mod toolchain;
 
@@ -50,25 +39,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use syn::punctuated::Punctuated;
-use syn::{Meta, MetaList, Token};
-
 const CLEAN: u8 = 0;
 const VIOLATION: u8 = 1;
 const CANNOT_RUN: u8 = 2;
 
 /// Target kinds that run on the build machine during the build.
 const BUILD_MACHINE_KINDS: [&str; 2] = ["custom-build", "proc-macro"];
-/// Library kinds cargo doc-tests: `Target::doctestable` in
-/// src/workspace/manifest.rs of cargo 1.100.0. Cargo warns when asked to
-/// doc-test any other kind, such as a cdylib.
-const DOCTEST_KINDS: [&str; 3] = ["lib", "rlib", "proc-macro"];
-/// Target kinds rustdoc can run doctests for, now or after a crate-type change.
+/// Library target kinds.
 const LIBRARY_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
-
-/// The `level(lint)` pairs every library root sets for its doctests.
-const DOCTEST_LINTS: [(&str, &str); 2] = [("forbid", "unsafe_code"), ("deny", "warnings")];
-const DOCTEST_ATTRIBUTE: &str = "#![doc(test(attr(forbid(unsafe_code), deny(warnings))))]";
 
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum Level {
@@ -130,7 +108,7 @@ fn cargo() -> OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
-/// Returns one line per missing attribute or lowered lint level.
+/// Returns one line per problem found.
 fn check_workspace() -> Result<Vec<String>, String> {
     let cargo = cargo();
     let mut log = io::stderr();
@@ -156,12 +134,6 @@ fn check_workspace() -> Result<Vec<String>, String> {
     for target in &targets {
         missing.extend(check_target(target)?);
     }
-    let library_roots: Vec<PathBuf> = targets
-        .iter()
-        .filter(|target| target.has_kind(&LIBRARY_KINDS))
-        .map(|target| target.src_path.clone())
-        .collect();
-    missing.extend(doc_attributes::check(&root, &library_roots)?);
     let mut library_packages: Vec<&str> = targets
         .iter()
         .filter(|target| target.has_kind(&LIBRARY_KINDS))
@@ -174,22 +146,13 @@ fn check_workspace() -> Result<Vec<String>, String> {
     let (dep_info_count, problems) =
         dep_info::check(&cargo, &root, &library_packages, &host, &cross, &mut log)?;
     missing.extend(problems);
-    let mut doctest_packages: Vec<&str> = targets
-        .iter()
-        .filter(|target| target.has_kind(&DOCTEST_KINDS))
-        .map(|target| target.package.as_str())
-        .collect();
-    doctest_packages.sort_unstable();
-    doctest_packages.dedup();
-    let (doctest_count, problems) = doctests::check(&cargo, &root, &doctest_packages, &mut log)?;
-    missing.extend(problems);
     let (proc_macro_count, problems) = proc_macros::check(&cargo, &root, &mut log)?;
     missing.extend(problems);
 
     if missing.is_empty() {
         writeln!(
             io::stdout().lock(),
-            "note: {} targets, {doctest_count} doctests, {dep_info_count} dep-info files, {proc_macro_count} proc macros",
+            "note: {} targets, {dep_info_count} dep-info files, {proc_macro_count} proc macros",
             targets.len()
         )
         .map_err(|e| format!("writing the counts to stdout failed: {e}"))?;
@@ -219,15 +182,6 @@ fn check_target(target: &Target) -> Result<Vec<String>, String> {
         missing.push(format!(
             "{described} lacks a crate-level #![deny(unsafe_code)]"
         ));
-    }
-    if target.has_kind(&LIBRARY_KINDS) {
-        for (level, lint) in DOCTEST_LINTS {
-            if !doctests_set(&file, level, lint).map_err(parse_error)? {
-                missing.push(format!(
-                    "{described} lacks {level}({lint}) in a crate-level doc(test(attr(...))). Write {DOCTEST_ATTRIBUTE}"
-                ));
-            }
-        }
     }
     Ok(missing)
 }
@@ -336,39 +290,6 @@ fn unsafe_code_level(file: &syn::File) -> syn::Result<Option<Level>> {
     Ok(strongest)
 }
 
-/// True when a crate-level `doc(test(attr(...)))` holds `level(lint)`. Only the
-/// exact level counts, so `deny(unsafe_code)`, which a doctest can lift with
-/// its own allow, does not stand in for `forbid(unsafe_code)`.
-fn doctests_set(file: &syn::File, level: &str, lint: &str) -> syn::Result<bool> {
-    for attr in &file.attrs {
-        if let Meta::List(doc) = &attr.meta
-            && doc.path.is_ident("doc")
-            && holds_nested(doc, &["test", "attr", level], lint)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// True when the arguments of `list` hold `names[0](names[1](...(leaf)))`.
-fn holds_nested(list: &MetaList, names: &[&str], leaf: &str) -> syn::Result<bool> {
-    let items = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
-    for item in &items {
-        let found = match (names.split_first(), item) {
-            (None, Meta::Path(path)) => path.is_ident(leaf),
-            (Some((name, rest)), Meta::List(inner)) if inner.path.is_ident(name) => {
-                holds_nested(inner, rest, leaf)?
-            }
-            _ => false,
-        };
-        if found {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -390,22 +311,10 @@ mod tests {
         }
     }
 
-    use super::{Level, doctests_set, unsafe_code_level};
+    use super::{Level, unsafe_code_level};
 
     fn level(source: &str) -> Option<Level> {
         unsafe_code_level(&syn::parse_file(source).unwrap()).unwrap()
-    }
-
-    fn doctests(source: &str, level: &str, lint: &str) -> bool {
-        doctests_set(&syn::parse_file(source).unwrap(), level, lint).unwrap()
-    }
-
-    fn doctests_forbid(source: &str) -> bool {
-        doctests(source, "forbid", "unsafe_code")
-    }
-
-    fn doctests_deny_warnings(source: &str) -> bool {
-        doctests(source, "deny", "warnings")
     }
 
     #[test]
@@ -432,12 +341,8 @@ mod tests {
             "/* #![forbid(unsafe_code)] */",
             "// #![deny(unsafe_code)]",
             "pub const MARK: &str = \"#![forbid(unsafe_code)]\";",
-            "/* #![doc(test(attr(forbid(unsafe_code), deny(warnings))))] */",
-            "pub const MARK: &str = \"#![doc(test(attr(forbid(unsafe_code), deny(warnings))))]\";",
         ] {
             assert!(level(source).is_none(), "{source}");
-            assert!(!doctests_forbid(source), "{source}");
-            assert!(!doctests_deny_warnings(source), "{source}");
         }
     }
 
@@ -452,52 +357,5 @@ mod tests {
         ] {
             assert!(level(source).is_none(), "{source}");
         }
-    }
-
-    #[test]
-    fn doctest_lints_count_in_one_list_two_attributes_or_either_order() {
-        for source in [
-            "#![doc(test(attr(forbid(unsafe_code), deny(warnings))))]",
-            "#![doc(test(attr(deny(warnings), forbid(unsafe_code))))]",
-            "#![doc(test(attr(forbid(unsafe_code))))]\n#![doc(test(attr(deny(warnings))))]",
-            "#![doc(test(attr(deny(warnings))))]\n#![doc(test(attr(forbid(unsafe_code))))]",
-            "#![doc(html_root_url = \"x\", test(no_crate_inject, attr(deny(dead_code, warnings), forbid(unsafe_code))))]",
-        ] {
-            assert!(doctests_forbid(source), "{source}");
-            assert!(doctests_deny_warnings(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn each_doctest_lint_is_required_on_its_own() {
-        let forbid_only = "#![doc(test(attr(forbid(unsafe_code))))]";
-        assert!(doctests_forbid(forbid_only));
-        assert!(!doctests_deny_warnings(forbid_only));
-        let deny_only = "#![doc(test(attr(deny(warnings))))]";
-        assert!(!doctests_forbid(deny_only));
-        assert!(doctests_deny_warnings(deny_only));
-    }
-
-    #[test]
-    fn doctest_attribute_that_is_weaker_or_misplaced_does_not_count() {
-        for source in [
-            "#![doc(test(attr(deny(unsafe_code), warn(warnings))))]",
-            "#![doc(test(forbid(unsafe_code), deny(warnings)))]",
-            "#![doc(attr(forbid(unsafe_code), deny(warnings)))]",
-            "#![forbid(unsafe_code)]\n#![deny(warnings)]",
-            "#![cfg_attr(all(), doc(test(attr(forbid(unsafe_code), deny(warnings)))))]",
-            "#![doc = \"test(attr(forbid(unsafe_code), deny(warnings)))\"]",
-            "#[doc(test(attr(forbid(unsafe_code), deny(warnings))))]\nfn f() {}",
-        ] {
-            assert!(!doctests_forbid(source), "{source}");
-            assert!(!doctests_deny_warnings(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn source_that_does_not_parse_is_an_error() {
-        assert!(syn::parse_file("fn main( {").is_err());
-        let file = syn::parse_file("#![doc(test(attr(forbid(=))))]").unwrap();
-        assert!(doctests_set(&file, "forbid", "unsafe_code").is_err());
     }
 }

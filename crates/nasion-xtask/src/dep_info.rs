@@ -14,7 +14,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use crate::doc_attributes::SKIPPED_DIRS;
+/// Directories under the workspace root that hold no workspace source.
+pub const SKIPPED_DIRS: [&str; 3] = ["target", ".venv", ".git"];
 
 /// Set by `scripts/checks.sh` from requires-python in pyproject.toml, and
 /// passed to PyO3 as `PYO3_CROSS_PYTHON_VERSION` for the cross runs.

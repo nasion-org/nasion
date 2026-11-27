@@ -45,7 +45,6 @@ dependencies = [
 name = "nasion-xtask"
 version = "0.1.0"
 dependencies = [
- "proc-macro2",
  "serde_json",
  "syn",
 ]
