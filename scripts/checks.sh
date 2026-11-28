@@ -261,6 +261,24 @@ check_unsafe_allow() {
     return "$worst"
 }
 
+# Prints one line for each proc-macro target of a workspace member, read from
+# cargo metadata on stdin (D52). Exits 2 when the metadata cannot be read.
+PROC_MACRO_TARGETS_PY='
+import json, sys
+try:
+    found = [
+        package["name"]
+        for package in json.load(sys.stdin)["packages"]
+        for target in package["targets"]
+        if "proc-macro" in target["kind"]
+    ]
+except (KeyError, TypeError, ValueError) as error:
+    print("Reading cargo metadata failed:", error)
+    sys.exit(2)
+for name in found:
+    print(name, "has a proc-macro target, and no workspace member may have one (D52)")
+'
+
 # Prints one line for each workspace member whose Cargo.toml does not set
 # [lints] workspace = true, read from cargo metadata on stdin.
 LINTS_INHERIT_PY='
@@ -305,11 +323,11 @@ for manifest in sorted(stray):
 sys.exit(1 if stray else 0)
 '
 
-# Every workspace member must inherit [workspace.lints]. Members come from
-# cargo metadata, never from a fixed list, and every Cargo.toml on disk must
-# belong to a member so none escapes that list.
+# Every workspace member must inherit [workspace.lints] and have no proc-macro
+# target (D52). Members come from cargo metadata, never from a fixed list, and
+# every Cargo.toml on disk must belong to a member so none escapes that list.
 check_deny_unsafe() {
-    local meta meta_err missing stray status output warned=0
+    local meta meta_err missing stray macros status output warned=0
     if ! meta_err=$(mktemp); then
         echo "mktemp failed, so the stderr of cargo metadata cannot be kept. Check that the temporary directory is writable."
         return 2
@@ -339,6 +357,11 @@ check_deny_unsafe() {
         return 2
     fi
     missing+=${stray:+${missing:+$'\n'}$stray}
+    if ! macros=$(python3 -I -c "$PROC_MACRO_TARGETS_PY" <<<"$meta"); then
+        echo "$macros"
+        return 2
+    fi
+    missing+=${macros:+${missing:+$'\n'}$macros}
     # Without --quiet, because --quiet also hides cargo's warnings.
     output=$(CARGO_TERM_COLOR=never cargo run --locked -p nasion-xtask 2>&1)
     status=$?

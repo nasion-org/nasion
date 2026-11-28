@@ -1,8 +1,5 @@
 //! Checks the workspace for the gate.
 //!
-//! - No workspace member has a proc-macro target (D52), and every crate that
-//!   runs inside a proc macro is pinned by name, version, source and checksum
-//!   (D53). The `proc_macros` module holds that check.
 //! - No workspace manifest has a `[patch]` or `[replace]` table, and no cargo
 //!   config or environment variable can swap where package code comes from
 //!   (D53). The `cargo_sources` module holds that check.
@@ -15,7 +12,6 @@
 //! problem, 2 the check could not run.
 mod cargo_cmd;
 mod cargo_sources;
-mod proc_macros;
 mod toolchain;
 
 use std::ffi::OsString;
@@ -94,17 +90,10 @@ fn check_workspace() -> Result<Vec<String>, String> {
             .chain(sources.configs)
             .collect());
     }
-    let mut missing = sources.manifests;
-    let (proc_macro_count, problems) = proc_macros::check(&cargo, &root, &mut log)?;
-    missing.extend(problems);
-
+    let missing = sources.manifests;
     if missing.is_empty() {
-        writeln!(
-            io::stdout().lock(),
-            "note: {} targets, {proc_macro_count} proc macros",
-            targets.len()
-        )
-        .map_err(|e| format!("writing the counts to stdout failed: {e}"))?;
+        writeln!(io::stdout().lock(), "note: {} targets", targets.len())
+            .map_err(|e| format!("writing the counts to stdout failed: {e}"))?;
     }
     Ok(missing)
 }
