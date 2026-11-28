@@ -84,7 +84,7 @@ check_instruction_paths() {
     search_result "${statuses[1]}" "instruction file search"
 }
 
-# Miri is not set up yet, so no unsafe code may compile in the workspace.
+# No unsafe code may compile in the workspace.
 # Forbidding unsafe_code on the command line turns every opt-out into a compile
 # error wherever it comes from: an untracked file, a #[path] module or a macro.
 # Registry dependencies build with --cap-lints, so the forbid reaches only
@@ -209,7 +209,7 @@ targets_ready() {
     echo "$cross"
 }
 
-check_unsafe_allow() {
+check_no_unsafe() {
     local ready lines python target output status worst=0 unsafe_targets=()
     if ! ready=$(targets_ready); then
         echo "$ready"
@@ -326,7 +326,7 @@ sys.exit(1 if stray else 0)
 # Every workspace member must inherit [workspace.lints] and have no proc-macro
 # target (D52). Members come from cargo metadata, never from a fixed list, and
 # every Cargo.toml on disk must belong to a member so none escapes that list.
-check_deny_unsafe() {
+check_workspace_members() {
     local meta meta_err missing stray macros status output warned=0
     if ! meta_err=$(mktemp); then
         echo "mktemp failed, so the stderr of cargo metadata cannot be kept. Check that the temporary directory is writable."
@@ -515,7 +515,7 @@ check_no_doctests() {
 }
 
 # Runs clippy with -D warnings once on the host and once for each cross target
-# (D38), the same split as check_unsafe_allow, each in its own target
+# (D38), the same split as check_no_unsafe, each in its own target
 # directory. Each run fails on warnings and on the [lints] warning, and a
 # failure names the target.
 check_clippy() {

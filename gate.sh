@@ -163,8 +163,8 @@ step "cargo fmt" fail_on_warnings cargo fmt --all --check
 step "cargo clippy" check_clippy
 step "cargo test" fail_on_warnings cargo test --locked --workspace
 step "no doctests" check_no_doctests
-step "miri" check_unsafe_allow
-step "deny unsafe" check_deny_unsafe
+step "no unsafe" check_no_unsafe
+step "workspace members" check_workspace_members
 step "cargo audit" check_cargo_audit
 step "ruff check" venv_tool ruff check python
 step "ruff format" venv_tool ruff format --check python
