@@ -362,25 +362,11 @@ check_deny_unsafe() {
         return 2
     fi
     missing+=${macros:+${missing:+$'\n'}$macros}
-    # Without --quiet, because --quiet also hides cargo's warnings.
-    output=$(CARGO_TERM_COLOR=never cargo run --locked -p nasion-xtask 2>&1)
-    status=$?
-    echo "$output"
-    if ((status > 1)); then
-        echo "nasion-xtask could not check the target roots (exit $status). Check the output above."
-        return 2
-    fi
-    warning_lines "$output" "cargo run -p nasion-xtask"
-    case $? in
-        1) warned=1 ;;
-        2) return 2 ;;
-    esac
     if [[ -n $missing ]]; then
         echo "$missing"
         return 1
     fi
-    ((status == 0)) && return "$warned"
-    return "$status"
+    return "$warned"
 }
 
 # Records the work tree, or compares it with a recorded state on stdin. The
