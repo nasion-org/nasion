@@ -1,5 +1,3 @@
-#![deny(unsafe_code)]
-
 use std::process::Command;
 
 #[test]

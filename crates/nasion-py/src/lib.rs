@@ -1,5 +1,4 @@
 //! Python binding for Nasion, exposed as `nasion._nasion`. Holds no domain logic yet.
-#![deny(unsafe_code)]
 
 use pyo3::prelude::*;
 

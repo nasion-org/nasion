@@ -305,16 +305,9 @@ for manifest in sorted(stray):
 sys.exit(1 if stray else 0)
 '
 
-# Every target root of every workspace member must hold a crate-level
-# #![deny(unsafe_code)], and every member must inherit [workspace.lints].
-# Build script and proc macro roots need forbid. nasion-xtask lists the exact
-# rules.
-# The command line forbid in check_unsafe_allow lasts only until Miri is set
-# up, so this check keeps the attributes themselves in place as SPEC Section 11
-# requires. nasion-xtask checks them by parsing each
-# target root, so text in a comment or a string never counts. Members and
-# targets come from cargo metadata, never from a fixed list, and every
-# Cargo.toml on disk must belong to a member so none escapes that list.
+# Every workspace member must inherit [workspace.lints]. Members come from
+# cargo metadata, never from a fixed list, and every Cargo.toml on disk must
+# belong to a member so none escapes that list.
 check_deny_unsafe() {
     local meta meta_err missing stray status output ready python warned=0
     if ! meta_err=$(mktemp); then

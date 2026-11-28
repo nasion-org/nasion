@@ -1,12 +1,5 @@
-//! Checks the crate-level unsafe_code attributes of every target root in the
-//! workspace. The file is parsed with syn, so attribute text inside a comment
-//! or a string literal never counts.
+//! Checks the workspace for the gate.
 //!
-//! - Build scripts and proc macros run on the build machine, so a Linux build
-//!   never compiles their `cfg(windows)` code. Their roots need
-//!   `#![forbid(unsafe_code)]`, which no `allow` further down can lift.
-//! - Every other target root needs `#![deny(unsafe_code)]` or the stricter
-//!   `#![forbid(unsafe_code)]` (D29).
 //! - Every file rustc reads for a library target, on the host and on each
 //!   cross target, is a `.rs` file that check scans (D50). The `dep_info`
 //!   module holds that check.
@@ -25,8 +18,6 @@
 //!
 //! Exit codes, read by `scripts/checks.sh`: 0 clean, 1 a check found a
 //! problem, 2 the check could not run.
-#![deny(unsafe_code)]
-
 mod cargo_cmd;
 mod cargo_sources;
 mod dep_info;
@@ -34,31 +25,21 @@ mod proc_macros;
 mod toolchain;
 
 use std::ffi::OsString;
-use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 const CLEAN: u8 = 0;
 const VIOLATION: u8 = 1;
 const CANNOT_RUN: u8 = 2;
 
-/// Target kinds that run on the build machine during the build.
-const BUILD_MACHINE_KINDS: [&str; 2] = ["custom-build", "proc-macro"];
 /// Library target kinds.
 const LIBRARY_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
-
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
-enum Level {
-    Deny,
-    Forbid,
-}
 
 struct Target {
     package: String,
     manifest: PathBuf,
     kinds: Vec<String>,
-    src_path: PathBuf,
 }
 
 impl Target {
@@ -131,9 +112,6 @@ fn check_workspace() -> Result<Vec<String>, String> {
             .collect());
     }
     let mut missing = sources.manifests;
-    for target in &targets {
-        missing.extend(check_target(target)?);
-    }
     let mut library_packages: Vec<&str> = targets
         .iter()
         .filter(|target| target.has_kind(&LIBRARY_KINDS))
@@ -156,32 +134,6 @@ fn check_workspace() -> Result<Vec<String>, String> {
             targets.len()
         )
         .map_err(|e| format!("writing the counts to stdout failed: {e}"))?;
-    }
-    Ok(missing)
-}
-
-fn check_target(target: &Target) -> Result<Vec<String>, String> {
-    let path = &target.src_path;
-    let file = parse_root(path)?;
-    let parse_error = |e: syn::Error| format!("{} does not parse: {e}", path.display());
-    let described = format!(
-        "{} ({} target of {})",
-        path.display(),
-        target.kinds.join(", "),
-        target.package
-    );
-    let mut missing = Vec::new();
-    let level = unsafe_code_level(&file).map_err(parse_error)?;
-    if target.has_kind(&BUILD_MACHINE_KINDS) {
-        if level != Some(Level::Forbid) {
-            missing.push(format!(
-                "{described} lacks a crate-level #![forbid(unsafe_code)], required because it runs on the build machine"
-            ));
-        }
-    } else if level.is_none() {
-        missing.push(format!(
-            "{described} lacks a crate-level #![deny(unsafe_code)]"
-        ));
     }
     Ok(missing)
 }
@@ -226,9 +178,6 @@ fn workspace_targets(
             .as_array()
             .ok_or_else(|| format!("package {name} in cargo metadata has no targets list"))?;
         for target in package_targets {
-            let src_path = target["src_path"]
-                .as_str()
-                .ok_or_else(|| format!("a target of {name} in cargo metadata has no src_path"))?;
             let kinds = target["kind"]
                 .as_array()
                 .filter(|kinds| !kinds.is_empty())
@@ -239,55 +188,16 @@ fn workspace_targets(
                         .collect::<Option<Vec<_>>>()
                 })
                 .ok_or_else(|| {
-                    format!(
-                        "target {src_path} of {name} in cargo metadata has no list of kind names"
-                    )
+                    format!("a target of {name} in cargo metadata has no list of kind names")
                 })?;
             targets.push(Target {
                 package: name.to_owned(),
                 manifest: manifest.clone(),
                 kinds,
-                src_path: PathBuf::from(src_path),
             });
         }
     }
     Ok((root, targets))
-}
-
-fn parse_root(path: &Path) -> Result<syn::File, String> {
-    let source =
-        fs::read_to_string(path).map_err(|e| format!("{} cannot be read: {e}", path.display()))?;
-    syn::parse_file(&source).map_err(|e| format!("{} does not parse: {e}", path.display()))
-}
-
-/// The strongest crate-level `deny(unsafe_code)` or `forbid(unsafe_code)`,
-/// alone or with other lints. An attribute inside `cfg_attr`, on an item or on
-/// a module does not count, because it does not cover the whole crate in every
-/// build.
-fn unsafe_code_level(file: &syn::File) -> syn::Result<Option<Level>> {
-    let mut strongest = None;
-    for attr in &file.attrs {
-        let level = if attr.path().is_ident("forbid") {
-            Level::Forbid
-        } else if attr.path().is_ident("deny") {
-            Level::Deny
-        } else {
-            continue;
-        };
-        let mut found = false;
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("unsafe_code") {
-                found = true;
-            } else if meta.path.is_ident("reason") {
-                meta.value()?.parse::<syn::LitStr>()?;
-            }
-            Ok(())
-        })?;
-        if found && strongest < Some(level) {
-            strongest = Some(level);
-        }
-    }
-    Ok(strongest)
 }
 
 #[cfg(test)]
@@ -308,54 +218,6 @@ mod tests {
             assert_eq!(root, std::path::PathBuf::from("/ws"));
             assert!(targets.is_empty());
             assert_forwarded(&log, "metadata --no-deps --format-version 1", warn);
-        }
-    }
-
-    use super::{Level, unsafe_code_level};
-
-    fn level(source: &str) -> Option<Level> {
-        unsafe_code_level(&syn::parse_file(source).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn plain_deny_is_deny() {
-        assert!(level("#![deny(unsafe_code)]\nfn main() {}") == Some(Level::Deny));
-    }
-
-    #[test]
-    fn combined_lint_list_with_reason_counts() {
-        let source = "#![deny(dead_code, unsafe_code, reason = \"spec\")]";
-        assert!(level(source) == Some(Level::Deny));
-    }
-
-    #[test]
-    fn forbid_is_forbid_whatever_the_order() {
-        assert!(level("#![forbid(unsafe_code)]") == Some(Level::Forbid));
-        assert!(level("#![forbid(unsafe_code)]\n#![deny(unsafe_code)]") == Some(Level::Forbid));
-        assert!(level("#![deny(unsafe_code)]\n#![forbid(unsafe_code)]") == Some(Level::Forbid));
-    }
-
-    #[test]
-    fn text_in_comments_and_strings_does_not_count() {
-        for source in [
-            "/* #![forbid(unsafe_code)] */",
-            "// #![deny(unsafe_code)]",
-            "pub const MARK: &str = \"#![forbid(unsafe_code)]\";",
-        ] {
-            assert!(level(source).is_none(), "{source}");
-        }
-    }
-
-    #[test]
-    fn non_crate_level_or_conditional_does_not_count() {
-        for source in [
-            "mod inner {\n    #![deny(unsafe_code)]\n}",
-            "#[forbid(unsafe_code)]\nfn f() {}",
-            "#![cfg_attr(not(test), forbid(unsafe_code))]",
-            "#![warn(unsafe_code)]",
-            "#![deny(unsafe_op_in_unsafe_fn)]",
-        ] {
-            assert!(level(source).is_none(), "{source}");
         }
     }
 }

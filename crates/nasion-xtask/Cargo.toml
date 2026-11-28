@@ -9,7 +9,6 @@ publish = false
 
 [dependencies]
 serde_json = "=1.0.154"
-syn = { version = "=3.0.10", default-features = false, features = ["full", "parsing"] }
 
 [lints]
 workspace = true
