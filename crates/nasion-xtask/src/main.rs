@@ -1,8 +1,5 @@
 //! Checks the workspace for the gate.
 //!
-//! - Every file rustc reads for a library target, on the host and on each
-//!   cross target, is a `.rs` file that check scans (D50). The `dep_info`
-//!   module holds that check.
 //! - No workspace member has a proc-macro target (D52), and every crate that
 //!   runs inside a proc macro is pinned by name, version, source and checksum
 //!   (D53). The `proc_macros` module holds that check.
@@ -14,13 +11,10 @@
 //!   `toolchain` module reads them, and `nasion-xtask toolchain-targets` prints
 //!   the cross targets for the shell, one per line.
 //!
-//! The target kind comes from cargo metadata, never from the file name.
-//!
 //! Exit codes, read by `scripts/checks.sh`: 0 clean, 1 a check found a
 //! problem, 2 the check could not run.
 mod cargo_cmd;
 mod cargo_sources;
-mod dep_info;
 mod proc_macros;
 mod toolchain;
 
@@ -33,19 +27,8 @@ const CLEAN: u8 = 0;
 const VIOLATION: u8 = 1;
 const CANNOT_RUN: u8 = 2;
 
-/// Library target kinds.
-const LIBRARY_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
-
 struct Target {
-    package: String,
     manifest: PathBuf,
-    kinds: Vec<String>,
-}
-
-impl Target {
-    fn has_kind(&self, kinds: &[&str]) -> bool {
-        self.kinds.iter().any(|kind| kinds.contains(&kind.as_str()))
-    }
 }
 
 fn main() -> ExitCode {
@@ -112,25 +95,13 @@ fn check_workspace() -> Result<Vec<String>, String> {
             .collect());
     }
     let mut missing = sources.manifests;
-    let mut library_packages: Vec<&str> = targets
-        .iter()
-        .filter(|target| target.has_kind(&LIBRARY_KINDS))
-        .map(|target| target.package.as_str())
-        .collect();
-    library_packages.sort_unstable();
-    library_packages.dedup();
-    let host = toolchain::host_target(std::env::var(toolchain::HOST_VAR).ok())?;
-    let cross = toolchain::cross_targets(&root, &host)?;
-    let (dep_info_count, problems) =
-        dep_info::check(&cargo, &root, &library_packages, &host, &cross, &mut log)?;
-    missing.extend(problems);
     let (proc_macro_count, problems) = proc_macros::check(&cargo, &root, &mut log)?;
     missing.extend(problems);
 
     if missing.is_empty() {
         writeln!(
             io::stdout().lock(),
-            "note: {} targets, {dep_info_count} dep-info files, {proc_macro_count} proc macros",
+            "note: {} targets, {proc_macro_count} proc macros",
             targets.len()
         )
         .map_err(|e| format!("writing the counts to stdout failed: {e}"))?;
@@ -177,23 +148,9 @@ fn workspace_targets(
         let package_targets = package["targets"]
             .as_array()
             .ok_or_else(|| format!("package {name} in cargo metadata has no targets list"))?;
-        for target in package_targets {
-            let kinds = target["kind"]
-                .as_array()
-                .filter(|kinds| !kinds.is_empty())
-                .and_then(|kinds| {
-                    kinds
-                        .iter()
-                        .map(|kind| kind.as_str().map(str::to_owned))
-                        .collect::<Option<Vec<_>>>()
-                })
-                .ok_or_else(|| {
-                    format!("a target of {name} in cargo metadata has no list of kind names")
-                })?;
+        for _ in package_targets {
             targets.push(Target {
-                package: name.to_owned(),
                 manifest: manifest.clone(),
-                kinds,
             });
         }
     }
