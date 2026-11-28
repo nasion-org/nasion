@@ -786,48 +786,32 @@ check_venv_matches_lock() {
     return "$status"
 }
 
-# Checks one sdist in the directory $1 for rust-toolchain.toml at its root,
-# with the same bytes as the file in the current directory. Exits 0 when it
-# is there once and identical, 1 when it is missing, differs, is not a
-# regular file or is there more than once, 2 when the sdist cannot be read.
+# Checks the one sdist in the directory $1 for rust-toolchain.toml in its top
+# directory, which maturin names like the archive, with the same bytes as the
+# file in the current directory. Exits 0 when it is there and identical, 1
+# when it is missing, is not a regular file or differs, 2 when the sdist
+# cannot be read.
 SDIST_TOOLCHAIN_PY='
 import pathlib
 import sys
 import tarfile
 
-out = pathlib.Path(sys.argv[1])
 name = "rust-toolchain.toml"
-archives = sorted(out.glob("*.tar.gz"))
-if len(archives) != 1:
-    print(f"maturin sdist wrote {len(archives)} .tar.gz files to {out}, expected one (D66).")
-    sys.exit(2)
 try:
+    (archive,) = pathlib.Path(sys.argv[1]).glob("*.tar.gz")
+    path = archive.name.removesuffix(".tar.gz") + "/" + name
     want = pathlib.Path(name).read_bytes()
-    with tarfile.open(archives[0]) as sdist:
-        members = sdist.getmembers()
-        tops = {member.name.split("/", 1)[0] for member in members}
-        if len(tops) != 1:
-            print(f"The sdist {archives[0].name} has {len(tops)} top directories, expected one (D66).")
-            sys.exit(2)
-        path = tops.pop() + "/" + name
-        found = [member for member in members if member.name == path]
-        if not found:
-            print(f"The sdist {archives[0].name} has no {path}, so a wheel built from it compiles with the builder default toolchain, not the pin. Add {name} to include in [tool.maturin] in pyproject.toml (D66).")
-            sys.exit(1)
-        if len(found) > 1:
-            print(f"The sdist {archives[0].name} holds {path} {len(found)} times, expected once (D66).")
-            sys.exit(1)
-        member = found[0]
-        if not member.isfile():
-            print(f"{path} in the sdist {archives[0].name} is not a regular file (D66).")
-            sys.exit(1)
-        extracted = sdist.extractfile(member)
-        got = extracted.read() if extracted else b""
-except (OSError, tarfile.TarError) as error:
+    with tarfile.open(archive) as sdist:
+        try:
+            member = sdist.getmember(path)
+        except KeyError:
+            member = None
+        got = sdist.extractfile(member).read() if member and member.isfile() else None
+except (OSError, EOFError, tarfile.TarError, ValueError) as error:
     print("Reading the sdist failed:", error)
     sys.exit(2)
 if got != want:
-    print(f"{path} in the sdist {archives[0].name} differs from {name} in the repository, so a wheel built from it does not use the pinned toolchain (D66).")
+    print(f"{path} in the sdist {archive.name} is missing, is not a regular file or differs from {name} in the repository, so a wheel built from it does not use the pinned toolchain. Add {name} to include in [tool.maturin] in pyproject.toml, or fix the entry (D66).")
     sys.exit(1)
 '
 
